@@ -3,9 +3,16 @@
 
 clear; clc; close all;
 
+script_dir = fileparts(mfilename('fullpath'));
+project_dir = fileparts(script_dir);
+if isempty(project_dir)
+    project_dir = pwd;
+end
+addpath(fullfile(project_dir, 'Algorithms'));
+
 %% Parameters
-N = 256;                   % Total number of subcarriers
-Nc = 32;                   % Number of communication subcarriers
+N = 128;                   % Total number of subcarriers
+Nc = 24;                   % Number of communication subcarriers
 Nr = N - Nc;               % Number of radar subcarriers
 modSC = 'QPSK';            % Communication modulation
 e = 0.2;                   % Communication energy ratio
@@ -13,6 +20,24 @@ monte = 10;                % Monte Carlo trials
 l_norm_order = 100;        % l-norm order
 iteration = 1000;          % Main iteration number
 os_factor = 4;             % Oversampling factor for CCDF evaluation
+base_random_seed = 1;      % Fixed per-trial seed base for reproducible parfor resume
+
+%% Parallel Monte Carlo settings
+use_parallel_monte_carlo = GetDefaultParallelMonteCarloSetting();
+parallel_pool_type = 'processes';  % 'processes' or 'threads'
+parallel_batch_size = 16;          % Number of Monte Carlo trials per parfor batch
+
+%% Result saving / checkpoint resume interface
+% Resume usage:
+%   1. First run: keep resume_simulation = true. The script periodically saves papr_results and mc_done.
+%   2. Continue later: keep key parameters unchanged, increase monte, and rerun. The script continues from mc_done + 1.
+%   3. Start a new independent run: set resume_simulation = false, or change result_file_mode/manual_result_file.
+resume_simulation = true;
+save_every_trials = 50;
+result_dir = script_dir;
+figure_dir = fullfile(project_dir, 'figure');
+result_file_mode = 'auto';  % 'auto': automatic file name; 'manual': use manual_result_file
+manual_result_file = fullfile(result_dir, 'CCDF_my_experiment.mat');
 
 % Parameters for the proposed OCDM algorithm in Mine.m
 mine_lambda = 0.0016;
@@ -40,11 +65,20 @@ mine_lambda_shrink = 0.5;
 %   Accurate mode: mine_update_mode = 'hybrid'; mine_mm_period = 0;
 %   Compromise   : mine_update_mode = 'fast';   mine_mm_period = 20;
 %                  (adds the expensive MM candidate every 20 iterations)
-mine_update_mode = 'fast';
+mine_update_mode = 'hybrid';
 mine_mm_period = 0;
 
-rng(1);
+rng(base_random_seed);
 
+if ~isfolder(result_dir)
+    mkdir(result_dir);
+end
+if ~isfolder(figure_dir)
+    mkdir(figure_dir);
+end
+if use_parallel_monte_carlo
+    StartParallelPool(parallel_pool_type, project_dir);
+end
 
 %% Waveform list
 waveforms = {
@@ -58,6 +92,19 @@ waveforms = {
 nWave = size(waveforms, 1);
 Progress = waitbar(0, 'Progress...');
 
+waveform_file_tag = strjoin(waveforms(:, 1).', '_');
+auto_result_name = sprintf('CCDF_ISAC_%s_N%d_Nc%d_e%.1f_l%d_Iter%d.mat', ...
+    waveform_file_tag, N, Nc, e, l_norm_order, iteration);
+switch lower(result_file_mode)
+    case 'auto'
+        result_file = fullfile(result_dir, auto_result_name);
+    case 'manual'
+        result_file = ResolveResultPath(manual_result_file, result_dir);
+    otherwise
+        error('result_file_mode must be ''auto'' or ''manual''.');
+end
+fprintf('CCDF checkpoint: %s\n', result_file);
+
 %% Storage
 papr_results = cell(1, nWave);
 aisl_results = cell(1, nWave); 
@@ -66,108 +113,100 @@ for w = 1:nWave
     papr_results{w} = zeros(1, monte);
     aisl_results{w} = zeros(1, monte);
 end
+mc_done = 0;
 
-%% =============辅助函数=============
+%% =============杈呭姪鍑芥暟=============
 PAPR_fun = @(x) max(abs(x(:)).^2) / mean(abs(x(:)).^2);
 FH = @(x) ifft(x)*sqrt(N);
 F = @(x) fft(x)*sqrt(N);
 
-function DFnT_matrix = DFnT(P)
-    m = (0:P-1)' * ones(1, P);
-    n = ones(P, 1) * (0:P-1);
-    fresnel_kernel = exp(1j * pi / P * (m - n).^2);
-    normalization = (1 / sqrt(P)) * exp((pi / 4) * 1j);
-    DFnT_matrix = normalization * fresnel_kernel;
-end
-
 Psi_os = DFnT(os_factor * N);
 
-%% Monte Carlo loop
-for m = 1:monte
-
-    waitbar(m / monte, Progress, sprintf('Progress: %d/%d (%.1f%%)', m, monte, 100 * m / monte));
-
-    % ===== 1. Random subcarrier allocation =====
-    rand_idx = randperm(N);
-    idx_comm = sort(rand_idx(1:Nc)).';
-    mask_comm = false(N, 1);
-    mask_comm(idx_comm) = true;
-    idx_radar = find(~mask_comm);
-
-    % ===== 2. Communication symbols =====
-    switch upper(modSC)
-        case 'BPSK'
-            bits = randi([0 1], Nc, 1);
-            zc_unit = exp(1j * pi * bits);
-        case 'QPSK'
-            bits = randi([0 1], 2 * Nc, 1);
-            zc_unit = (1 / sqrt(2)) * ...
-                ((2 * bits(1:2:end) - 1) + 1j * (2 * bits(2:2:end) - 1));
-        otherwise
-            error('Only BPSK/QPSK are supported.');
+if resume_simulation && isfile(result_file)
+    saved_checkpoint = load(result_file);
+    ValidateCheckpoint(saved_checkpoint, waveforms, N, Nc, e, modSC, ...
+        l_norm_order, iteration, os_factor, mine_lambda, ...
+        mine_pisl_guard, mine_lnorm_bound, mine_eig_mode, ...
+        mine_max_backtracking, mine_lambda_shrink, mine_update_mode, ...
+        mine_mm_period, base_random_seed);
+    papr_results = saved_checkpoint.papr_results;
+    mc_done = saved_checkpoint.mc_done;
+    if mc_done > monte
+        fprintf('Checkpoint has %d trials, current monte is %d. Truncating for plotting only.\n', ...
+            mc_done, monte);
+        mc_done = monte;
     end
-
-    zc = sqrt(e) * zc_unit / sqrt(Nc);
-
-    % ===== 3. Radar symbols =====
-    Er = 1 - e;
-    if Er <= 0
-        error('Parameter e is too large and leaves no radar energy.');
-    end
-
-    zr = randn(Nr, 1) + 1j * randn(Nr, 1);
-    zr = zr / norm(zr) * sqrt(Er);
-
-    % ===== 4. Composite frequency-domain vector =====
-    z = zeros(N, 1);
-    z(idx_comm) = zc;
-    z(idx_radar) = zr;
-
-    % ===== 5. Waveform generation / optimization =====
     for w = 1:nWave
-        switch w
-            case 1  % Proposed algorithm
-                z_mine = Mine(z, idx_comm, idx_radar, ...
-                    'maxIt', iteration, ...
-                    'minIt', 200, ...
-                    'lNormOrder', l_norm_order, ...
-                    'lambda', mine_lambda, ...
-                    'osFactor', os_factor, ...
-                    'epsStop', mine_pisl_guard, ...
-                    'lnormBound', mine_lnorm_bound, ...
-                    'etaMode', mine_eig_mode, ...
-                    'maxBacktracking', mine_max_backtracking, ...
-                    'backtrackingShrink', mine_lambda_shrink, ...
-                    'UpdateMode', mine_update_mode, ...
-                    'mmPeriod', mine_mm_period, ...
-                    'PaprWeight', 0.85);
-                z_padded = zeros(os_factor * N, 1);
-                z_padded(1:N) = z_mine;
-                time_signal = Psi_os' * z_padded * sqrt(os_factor * N);
-
-            case 2  % Original OCDM
-                z_padded = zeros(os_factor * N, 1);
-                z_padded(1:N) = z;
-                time_signal = Psi_os' * z_padded * sqrt(os_factor * N);
-
-            case 3  % Original OFDM
-                z_padded = [z; zeros((os_factor - 1) * N, 1)];
-                time_signal = ifft(z_padded) * sqrt(os_factor * N);
-
-            case 4  % Varshney
-                time_signal = Varshney(z, idx_comm, idx_radar);
-
-            case 5  % Wang
-                z_wang = Wang(z, idx_comm, idx_radar, ...
-                    'L', 4, ...
-                    'Iter', 2, ...
-                    'UseCVX', true);
-                time_signal = FH(z_wang);
+        if numel(papr_results{w}) < monte
+            papr_results{w}(end + 1:monte) = 0;
+        elseif numel(papr_results{w}) > monte
+            papr_results{w} = papr_results{w}(1:monte);
         end
-
-        papr_results{w}(m) = PAPR_fun(time_signal);
     end
+    fprintf('Resuming CCDF simulation from %s, completed %d/%d Monte Carlo trials\n', ...
+        result_file, mc_done, monte);
 end
+
+%% Monte Carlo loop
+parallel_batch_size = max(1, min(parallel_batch_size, monte));
+batch_start = mc_done + 1;
+while batch_start <= monte
+    batch_end = min(batch_start + parallel_batch_size - 1, monte);
+    if batch_end > mc_done + save_every_trials
+        batch_end = mc_done + save_every_trials;
+    end
+    batch_mc = batch_start:batch_end;
+    nBatch = numel(batch_mc);
+    papr_batch = zeros(nBatch, nWave);
+
+    waitbar(batch_start / monte, Progress, ...
+        sprintf('Progress: %d-%d/%d', batch_start, batch_end, monte));
+    fprintf('Monte Carlo batch: %d-%d/%d\n', batch_start, batch_end, monte);
+
+    if use_parallel_monte_carlo
+        parfor ii = 1:nBatch
+            mc = batch_mc(ii);
+            papr_batch(ii, :) = RunOneMonteCarloTrial(mc, base_random_seed, ...
+                N, Nc, Nr, modSC, e, nWave, os_factor, Psi_os, iteration, ...
+                l_norm_order, mine_lambda, mine_pisl_guard, ...
+                mine_lnorm_bound, mine_eig_mode, mine_max_backtracking, ...
+                mine_lambda_shrink, mine_update_mode, mine_mm_period);
+        end
+    else
+        for ii = 1:nBatch
+            mc = batch_mc(ii);
+            papr_batch(ii, :) = RunOneMonteCarloTrial(mc, base_random_seed, ...
+                N, Nc, Nr, modSC, e, nWave, os_factor, Psi_os, iteration, ...
+                l_norm_order, mine_lambda, mine_pisl_guard, ...
+                mine_lnorm_bound, mine_eig_mode, mine_max_backtracking, ...
+                mine_lambda_shrink, mine_update_mode, mine_mm_period);
+        end
+    end
+
+    for w = 1:nWave
+        papr_results{w}(batch_mc) = papr_batch(:, w).';
+    end
+    mc_done = batch_end;
+    waitbar(mc_done / monte, Progress, ...
+        sprintf('Progress: %d/%d (%.1f%%)', mc_done, monte, 100 * mc_done / monte));
+
+    if mod(mc_done, save_every_trials) == 0 || mc_done == monte
+        SaveCheckpoint(result_file, papr_results, mc_done, waveforms, ...
+            N, Nc, Nr, modSC, e, monte, l_norm_order, iteration, os_factor, ...
+            mine_lambda, mine_pisl_guard, mine_lnorm_bound, mine_eig_mode, ...
+            mine_max_backtracking, mine_lambda_shrink, mine_update_mode, ...
+            mine_mm_period, base_random_seed);
+        fprintf('  Checkpoint saved: %d/%d Monte Carlo trials\n', mc_done, monte);
+    end
+
+    batch_start = batch_end + 1;
+end
+
+SaveCheckpoint(result_file, papr_results, mc_done, waveforms, ...
+    N, Nc, Nr, modSC, e, monte, l_norm_order, iteration, os_factor, ...
+    mine_lambda, mine_pisl_guard, mine_lnorm_bound, mine_eig_mode, ...
+    mine_max_backtracking, mine_lambda_shrink, mine_update_mode, ...
+    mine_mm_period, base_random_seed);
 
 %% CCDF plotting
 if isgraphics(Progress)
@@ -262,7 +301,12 @@ xlim(ax, [thresholds(1), thresholds(end)]);
 valid_curves = ccdf_curves(cellfun(@(c) any(c > 0), ccdf_curves));
 if ~isempty(valid_curves)
     min_positive_ccdf = min(cellfun(@(c) min(c(c > 0)), valid_curves));
-    ylim(ax, [10^(floor(log10(min_positive_ccdf))), 1]);
+    if min_positive_ccdf < 1
+        y_lower = 10^(floor(log10(min_positive_ccdf)));
+    else
+        y_lower = 0.1;
+    end
+    ylim(ax, [y_lower, 1]);
 end
 
 xlabel(ax, 'PAPR (dB)', 'FontName', 'Times New Roman', 'FontSize', 15, 'FontWeight', 'bold');
@@ -292,3 +336,216 @@ savefig(fig, sprintf('CCDF_main_first1.fig'));
 hold(ax, 'off');
 
 fprintf('Done!\n');
+
+function use_parallel = GetDefaultParallelMonteCarloSetting()
+use_parallel = true;
+end
+
+function DFnT_matrix = DFnT(P)
+m = (0:P-1)' * ones(1, P);
+n = ones(P, 1) * (0:P-1);
+fresnel_kernel = exp(1j * pi / P * (m - n).^2);
+normalization = (1 / sqrt(P)) * exp((pi / 4) * 1j);
+DFnT_matrix = normalization * fresnel_kernel;
+end
+
+function papr_values = RunOneMonteCarloTrial(mc, base_random_seed, N, Nc, Nr, ...
+    modSC, e, nWave, os_factor, Psi_os, iteration, l_norm_order, ...
+    mine_lambda, mine_pisl_guard, mine_lnorm_bound, mine_eig_mode, ...
+    mine_max_backtracking, mine_lambda_shrink, mine_update_mode, mine_mm_period)
+rng(GetTrialSeed(base_random_seed, mc), 'twister');
+PAPR_fun = @(x) max(abs(x(:)).^2) / mean(abs(x(:)).^2);
+FH = @(x) ifft(x)*sqrt(N);
+
+rand_idx = randperm(N);
+idx_comm = sort(rand_idx(1:Nc)).';
+mask_comm = false(N, 1);
+mask_comm(idx_comm) = true;
+idx_radar = find(~mask_comm);
+
+switch upper(modSC)
+    case 'BPSK'
+        bits = randi([0 1], Nc, 1);
+        zc_unit = exp(1j * pi * bits);
+    case 'QPSK'
+        bits = randi([0 1], 2 * Nc, 1);
+        zc_unit = (1 / sqrt(2)) * ...
+            ((2 * bits(1:2:end) - 1) + 1j * (2 * bits(2:2:end) - 1));
+    otherwise
+        error('Only BPSK/QPSK are supported.');
+end
+
+zc = sqrt(e) * zc_unit / sqrt(Nc);
+Er = 1 - e;
+if Er <= 0
+    error('Parameter e is too large and leaves no radar energy.');
+end
+zr = randn(Nr, 1) + 1j * randn(Nr, 1);
+zr = zr / norm(zr) * sqrt(Er);
+
+z = zeros(N, 1);
+z(idx_comm) = zc;
+z(idx_radar) = zr;
+
+papr_values = zeros(1, nWave);
+for w = 1:nWave
+    switch w
+        case 1
+            z_mine = Mine(z, idx_comm, idx_radar, ...
+                'maxIt', iteration, ...
+                'minIt', 200, ...
+                'lNormOrder', l_norm_order, ...
+                'lambda', mine_lambda, ...
+                'osFactor', os_factor, ...
+                'epsStop', mine_pisl_guard, ...
+                'lnormBound', mine_lnorm_bound, ...
+                'etaMode', mine_eig_mode, ...
+                'maxBacktracking', mine_max_backtracking, ...
+                'backtrackingShrink', mine_lambda_shrink, ...
+                'UpdateMode', mine_update_mode, ...
+                'mmPeriod', mine_mm_period, ...
+                'PaprWeight', 0.85);
+            z_padded = zeros(os_factor * N, 1);
+            z_padded(1:N) = z_mine;
+            time_signal = Psi_os' * z_padded * sqrt(os_factor * N);
+        case 2
+            z_padded = zeros(os_factor * N, 1);
+            z_padded(1:N) = z;
+            time_signal = Psi_os' * z_padded * sqrt(os_factor * N);
+        case 3
+            z_padded = [z; zeros((os_factor - 1) * N, 1)];
+            time_signal = ifft(z_padded) * sqrt(os_factor * N);
+        case 4
+            time_signal = Varshney(z, idx_comm, idx_radar);
+        case 5
+            z_wang = Wang(z, idx_comm, idx_radar, ...
+                'L', 4, ...
+                'Iter', 2, ...
+                'UseCVX', true);
+            time_signal = FH(z_wang);
+    end
+    papr_values(w) = PAPR_fun(time_signal);
+end
+end
+
+function seed = GetTrialSeed(base_random_seed, mc)
+seed = mod(double(base_random_seed) + 1000003 * double(mc), 2^32 - 1);
+if seed == 0
+    seed = 1;
+end
+end
+
+function StartParallelPool(pool_type, project_dir)
+pool = gcp('nocreate');
+if ~isempty(pool)
+    return;
+end
+switch lower(pool_type)
+    case 'processes'
+        pool = parpool('Processes');
+    case 'threads'
+        pool = parpool('Threads');
+    otherwise
+        error('parallel_pool_type must be ''processes'' or ''threads''.');
+end
+if isa(pool, 'parallel.ProcessPool')
+    addAttachedFiles(pool, {
+        fullfile(project_dir, 'Algorithms', 'Mine.m'), ...
+        fullfile(project_dir, 'Algorithms', 'Varshney.m'), ...
+        fullfile(project_dir, 'Algorithms', 'Wang.m')});
+end
+end
+
+function SaveCheckpoint(result_file, papr_results, mc_done, waveforms, ...
+    N, Nc, Nr, modSC, e, monte, l_norm_order, iteration, ...
+    os_factor, mine_lambda, mine_pisl_guard, mine_lnorm_bound, ...
+    mine_eig_mode, mine_max_backtracking, mine_lambda_shrink, ...
+    mine_update_mode, mine_mm_period, base_random_seed)
+save(result_file, ...
+    'papr_results', 'mc_done', 'waveforms', ...
+    'N', 'Nc', 'Nr', 'modSC', 'e', 'monte', 'l_norm_order', ...
+    'iteration', 'os_factor', 'mine_lambda', 'mine_pisl_guard', ...
+    'mine_lnorm_bound', 'mine_eig_mode', 'mine_max_backtracking', ...
+    'mine_lambda_shrink', 'mine_update_mode', 'mine_mm_period', ...
+    'base_random_seed');
+end
+
+function ValidateCheckpoint(saved, waveforms, N, Nc, e, modSC, ...
+    l_norm_order, iteration, os_factor, mine_lambda, mine_pisl_guard, ...
+    mine_lnorm_bound, mine_eig_mode, mine_max_backtracking, ...
+    mine_lambda_shrink, mine_update_mode, mine_mm_period, base_random_seed)
+required_fields = {'papr_results', 'mc_done', 'waveforms', 'N', 'Nc', ...
+    'e', 'modSC', 'l_norm_order', 'iteration', 'os_factor', ...
+    'mine_lambda', 'mine_pisl_guard', 'mine_lnorm_bound', ...
+    'mine_eig_mode', 'mine_max_backtracking', 'mine_lambda_shrink', ...
+    'mine_update_mode', 'mine_mm_period', 'base_random_seed'};
+for k = 1:numel(required_fields)
+    if ~isfield(saved, required_fields{k})
+        error('Checkpoint file does not contain %s.', required_fields{k});
+    end
+end
+if ~isequal(saved.waveforms, waveforms)
+    error('Checkpoint waveforms do not match the current simulation.');
+end
+if saved.N ~= N
+    error('Checkpoint N does not match the current simulation.');
+end
+if saved.Nc ~= Nc
+    error('Checkpoint Nc does not match the current simulation.');
+end
+if abs(saved.e - e) > eps
+    error('Checkpoint communication energy ratio e does not match the current simulation.');
+end
+if ~strcmpi(saved.modSC, modSC)
+    error('Checkpoint modulation does not match the current simulation.');
+end
+if saved.l_norm_order ~= l_norm_order
+    error('Checkpoint l_norm_order does not match the current simulation.');
+end
+if saved.iteration ~= iteration
+    error('Checkpoint iteration does not match the current simulation.');
+end
+if saved.os_factor ~= os_factor
+    error('Checkpoint os_factor does not match the current simulation.');
+end
+if abs(saved.mine_lambda - mine_lambda) > eps
+    error('Checkpoint mine_lambda does not match the current simulation.');
+end
+if abs(saved.mine_pisl_guard - mine_pisl_guard) > eps
+    error('Checkpoint mine_pisl_guard does not match the current simulation.');
+end
+if ~strcmp(saved.mine_lnorm_bound, mine_lnorm_bound)
+    error('Checkpoint mine_lnorm_bound does not match the current simulation.');
+end
+if ~strcmp(saved.mine_eig_mode, mine_eig_mode)
+    error('Checkpoint mine_eig_mode does not match the current simulation.');
+end
+if saved.mine_max_backtracking ~= mine_max_backtracking
+    error('Checkpoint mine_max_backtracking does not match the current simulation.');
+end
+if abs(saved.mine_lambda_shrink - mine_lambda_shrink) > eps
+    error('Checkpoint mine_lambda_shrink does not match the current simulation.');
+end
+if ~strcmp(saved.mine_update_mode, mine_update_mode)
+    error('Checkpoint mine_update_mode does not match the current simulation.');
+end
+if saved.mine_mm_period ~= mine_mm_period
+    error('Checkpoint mine_mm_period does not match the current simulation.');
+end
+if saved.base_random_seed ~= base_random_seed
+    error('Checkpoint base_random_seed does not match the current simulation.');
+end
+end
+
+function result_file = ResolveResultPath(result_file, result_dir)
+if isempty(result_file)
+    error('Result file path cannot be empty.');
+end
+if ~isfolder(result_dir)
+    mkdir(result_dir);
+end
+[folder, ~, ~] = fileparts(result_file);
+if isempty(folder)
+    result_file = fullfile(result_dir, result_file);
+end
+end
